@@ -234,9 +234,12 @@ def _build_validation_failure_prompt(original_prompt: str, previous: Attempt) ->
 
 
 def _try_json(candidate: str) -> Optional[dict]:
+    # Huge int literals (over sys.get_int_max_str_digits()) raise a plain
+    # ValueError and very deep nesting raises RecursionError, neither of
+    # which is a JSONDecodeError — both are just unusable candidates.
     try:
         obj = json.loads(candidate)
-    except (json.JSONDecodeError, TypeError):
+    except (json.JSONDecodeError, TypeError, ValueError, RecursionError):
         return None
     return obj if isinstance(obj, dict) else None
 
@@ -252,7 +255,7 @@ def _iter_raw_decoded_objects(text: str):
             continue
         try:
             obj, _ = decoder.raw_decode(text, idx)
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, ValueError, RecursionError):
             continue
         if isinstance(obj, dict):
             yield obj
@@ -272,13 +275,18 @@ def _attempt_from_parsed(parsed, raw_text: str) -> Tuple[Optional[Attempt], Opti
     if isinstance(answer, (dict, list)):
         return None, "'answer' was a dict/list, not a scalar value"
     if not isinstance(answer, str):
-        answer = str(answer)
+        # An int over sys.get_int_max_str_digits() digits raises ValueError.
+        try:
+            answer = str(answer)
+        except ValueError as e:
+            return None, f"'answer' could not be converted to a string: {e}"
 
     if isinstance(confidence, bool):  # bool is an int subclass, so check before float()
         return None, "'confidence' was a boolean, not a number"
     try:
         confidence = float(confidence)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        # OverflowError: an int too large to convert to float.
         return None, f"'confidence' could not be converted to a float: {confidence!r}"
     if not 0.0 <= confidence <= 1.0:
         return None, f"'confidence' {confidence} is out of the [0.0, 1.0] range"
@@ -659,13 +667,19 @@ def _call_fn_to_attempt(raw) -> Optional[Attempt]:
 
 
 def _parse_call_response(raw, parse_fn: Optional[ParseFn]) -> Attempt:
-    if parse_fn is None:
-        return _parse_response(raw)
+    # A malformed model response must come back as a failed parse attempt,
+    # never raise out of check()/acheck() — same rule as call_fn/parse_fn
+    # below, as a backstop for the parser itself.
     try:
-        parsed = parse_fn(raw)
+        if parse_fn is None:
+            return _parse_response(raw)
+        try:
+            parsed = parse_fn(raw)
+        except Exception as e:
+            return _failed_parse_attempt(raw, f"parse_fn raised {type(e).__name__}: {e}")
+        return _attempt_from_parsed_response(parsed, raw)
     except Exception as e:
-        return _failed_parse_attempt(raw, f"parse_fn raised {type(e).__name__}: {e}")
-    return _attempt_from_parsed_response(parsed, raw)
+        return _failed_parse_attempt(raw, f"response parsing raised {type(e).__name__}: {e}")
 
 
 def check(
